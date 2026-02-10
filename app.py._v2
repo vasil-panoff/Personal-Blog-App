@@ -1,0 +1,153 @@
+from flask import Flask, render_template_string, request, redirect, url_for
+import boto3
+import os
+import uuid
+
+app = Flask(__name__)
+
+# DynamoDB setup
+dynamodb = boto3.resource(
+    'dynamodb',
+    region_name=os.getenv("AWS_REGION", "eu-central-1")
+)
+table = dynamodb.Table(os.getenv("BLOG_TABLE", "BlogPosts"))
+
+# HTML template with form and buttons
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My Blog</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f9; margin: 0; padding: 0; }
+        nav { background: #333; padding: 1rem; color: #fff; }
+        nav a { color: #fff; margin-right: 15px; text-decoration: none; }
+        .container { max-width: 800px; margin: 2rem auto; padding: 1rem; }
+        .card { background: #fff; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); padding: 1rem; margin-bottom: 1.5rem; }
+        h2 { margin-top: 0; }
+        form { background: #fff; padding: 1rem; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        input, textarea { width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ccc; border-radius: 6px; }
+        button {
+            background: #333;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            outline: none;
+            box-shadow: none;
+        }
+        button:hover { opacity: 0.9; }
+        .edit-btn { background-color: #28a745; margin-right: 5px; }
+        .delete-btn {
+            background-color: #dc3545;
+            border-left: none;
+            outline: none;
+            box-shadow: none;
+        }
+        a {
+            text-decoration: none;
+            display: inline-block;
+        }
+        a button {
+            margin: 0;
+            padding: 0;
+            border: none;
+            outline: none;
+            box-shadow: none;
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        {{ url_for(Home</a>
+        {{ url_for(New Post</a>
+    </nav>
+    <div class="container">
+        {% if posts %}
+            {% for post in posts %}
+                <div class="card">
+                    <h2>{{ post['title'] }}</h2>
+                    <p>{{ post['content'] }}</p>
+                    <div style="margin-top: 10px;">
+                        {{ url_for(
+                            <button class="edit-btn">Edit</button>
+                        </a>
+                        {{ url_for(
+                            <button class="delete-btn">Delete</button>
+                        </a>
+                    </div>
+                </div>
+            {% endfor %}
+        {% else %}
+            <p>No posts yet!</p>
+        {% endif %}
+    </div>
+    {% if form %}
+    <div class="container">
+        <form method="post">
+            <h2>{{ 'Edit Post' if edit else 'Add New Post' }}</h2>
+            <input type="text" name="title" placeholder="Title" value="{{ post.title if post else '' }}" required>
+            <textarea name="content" placeholder="Write your post here..." rows="5" required>{{ post.content if post else '' }}</textarea>
+            <button type="submit">{{ 'Update' if edit else 'Publish' }}</button>
+        </form>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    response = table.scan()
+    posts = response.get("Items", [])
+    posts.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return render_template_string(HTML_TEMPLATE, posts=posts, form=False)
+
+@app.route("/new", methods=["GET", "POST"])
+def new_post():
+    if request.method == "POST":
+        title = request.form["title"]
+        content = request.form["content"]
+
+        table.put_item(
+            Item={
+                "id": str(uuid.uuid4()),
+                "title": title,
+                "content": content,
+                "created_at": str(uuid.uuid1())
+            }
+        )
+        return redirect(url_for("index"))
+
+    return render_template_string(HTML_TEMPLATE, posts=None, form=True, edit=False, post=None)
+
+@app.route("/edit/<post_id>", methods=["GET", "POST"])
+def edit_post(post_id):
+    response = table.get_item(Key={"id": post_id})
+    post = response.get("Item")
+
+    if not post:
+        return "Post not found", 404
+
+    if request.method == "POST":
+        title = request.form["title"]
+        content = request.form["content"]
+
+        table.update_item(
+            Key={"id": post_id},
+            UpdateExpression="SET title = :t, content = :c",
+            ExpressionAttributeValues={":t": title, ":c": content}
+        )
+        return redirect(url_for("index"))
+
+    return render_template_string(HTML_TEMPLATE, posts=None, form=True, edit=True, post=post)
+
+@app.route("/delete/<post_id>")
+def delete_post(post_id):
+    table.delete_item(Key={"id": post_id})
+    return redirect(url_for("index"))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

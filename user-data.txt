@@ -1,0 +1,268 @@
+#!/bin/bash
+# ----------------------------
+# EC2 user-data script that adds Nginx as a reverse proxy with HTTPS using a self-signed certificate (you can later replace it with a real cert). 
+# Full setup with Flask, DynamoDB, systemd, and auto-start
+# ----------------------------
+
+# ----------------------------
+# Update system & install dependencies
+# ----------------------------
+sudo yum update -y
+sudo yum install -y python3 git nginx openssl
+
+# ----------------------------
+# Install Python packages
+# ----------------------------
+sudo pip3 install --upgrade pip
+sudo pip3 install Flask==2.3.4 boto3==1.31.0
+
+# ----------------------------
+# Create app directory
+# ----------------------------
+sudo mkdir -p /home/ec2-user/personal_blog
+cd /home/ec2-user/personal_blog
+
+# ----------------------------
+# Set environment variables
+# ----------------------------
+echo "export DYNAMO_TABLE=BlogPosts" >> /home/ec2-user/.bashrc
+echo "export AWS_REGION=eu-central-1" >> /home/ec2-user/.bashrc
+source /home/ec2-user/.bashrc
+
+# ----------------------------
+# Create Flask app.py
+# ----------------------------
+sudo bash -c 'cat << "EOF" > /home/ec2-user/personal_blog/app.py
+import os
+from flask import Flask, render_template, request, redirect, abort
+import boto3
+import uuid
+
+app = Flask(__name__)
+
+DYNAMO_TABLE = os.environ.get("DYNAMO_TABLE", "BlogPosts")
+AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
+
+dynamodb = boto3.client("dynamodb", region_name=AWS_REGION)
+
+# Create table if it does not exist
+if DYNAMO_TABLE not in dynamodb.list_tables()["TableNames"]:
+    dynamodb.create_table(
+        TableName=DYNAMO_TABLE,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST"
+    )
+    waiter = dynamodb.get_waiter("table_exists")
+    waiter.wait(TableName=DYNAMO_TABLE)
+
+def get_all_posts():
+    stmt = f"SELECT * FROM {DYNAMO_TABLE}"
+    resp = dynamodb.execute_statement(Statement=stmt)
+    items = resp.get("Items", [])
+    return [{"id": i["id"]["S"], "title": i.get("title", {}).get("S",""), "content": i.get("content", {}).get("S","")} for i in items]
+
+def get_post(post_id):
+    stmt = f"SELECT * FROM {DYNAMO_TABLE} WHERE id='{post_id}'"
+    resp = dynamodb.execute_statement(Statement=stmt)
+    items = resp.get("Items", [])
+    if not items:
+        return None
+    i = items[0]
+    return {"id": i["id"]["S"], "title": i.get("title", {}).get("S",""), "content": i.get("content", {}).get("S","")}
+
+def add_post(title, content):
+    post_id = str(uuid.uuid4())
+    stmt = f\"\"\"
+    INSERT INTO {DYNAMO_TABLE} VALUE {{
+        'id': '{post_id}',
+        'title': '{title}',
+        'content': '{content}'
+    }}
+    \"\"\"
+    dynamodb.execute_statement(Statement=stmt)
+    return post_id
+
+@app.route("/")
+def index():
+    return render_template("index.html", posts=get_all_posts())
+
+@app.route("/post/<post_id>")
+def post_detail(post_id):
+    post = get_post(post_id)
+    if not post: abort(404)
+    return render_template("post.html", post=post)
+
+@app.route("/add", methods=["GET","POST"])
+def add():
+    if request.method=="POST":
+        title = request.form.get("title","").strip()
+        content = request.form.get("content","").strip()
+        if title and content:
+            add_post(title, content)
+            return redirect("/")
+    return render_template("add.html")
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=True)
+EOF'
+
+# ----------------------------
+# Create templates
+# ----------------------------
+sudo mkdir -p /home/ec2-user/personal_blog/templates
+
+# index.html
+sudo bash -c 'cat << "EOF" > /home/ec2-user/personal_blog/templates/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>My Personal Blog</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+h1 { color: #333; }
+.nav { margin-bottom: 20px; }
+.nav a { text-decoration: none; background: #007BFF; color: white; padding: 8px 12px; border-radius: 4px; }
+.nav a:hover { background: #0056b3; }
+.post-card { background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.2); padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+.post-card h2 { margin-top: 0; }
+.post-card a { color: #007BFF; text-decoration: none; }
+.post-card a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>My Personal Blog</h1>
+<div class="nav"><a href="/add">➕ Add Post</a></div>
+{% for post in posts %}
+<div class="post-card">
+<h2><a href="/post/{{ post.id }}">{{ post.title }}</a></h2>
+<p>{{ post.content[:150] }}{% if post.content|length>150 %}...{% endif %}</p>
+</div>
+{% endfor %}
+</body>
+</html>
+EOF'
+
+# post.html
+sudo bash -c 'cat << "EOF" > /home/ec2-user/personal_blog/templates/post.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ post.title }}</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+h1 { color: #333; }
+.card { background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.2); padding: 20px; border-radius: 8px; }
+a { text-decoration: none; color: #007BFF; }
+a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>{{ post.title }}</h1>
+<p>{{ post.content }}</p>
+<a href="/">Back to Blog</a>
+</div>
+</body>
+</html>
+EOF'
+
+# add.html
+sudo bash -c 'cat << "EOF" > /home/ec2-user/personal_blog/templates/add.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Add Post</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+h1 { color: #333; }
+form { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); width: 400px; }
+input[type="text"], textarea { width: 100%; padding: 8px; margin: 8px 0; border-radius: 4px; border: 1px solid #ccc; }
+input[type="submit"] { background: #007BFF; color: white; padding: 8px 12px; border: none; border-radius: 4px; cursor: pointer; }
+input[type="submit"]:hover { background: #0056b3; }
+a { text-decoration: none; color: #007BFF; }
+a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>Add New Post</h1>
+<form method="post">
+<label>Title:</label><br>
+<input type="text" name="title" required><br>
+<label>Content:</label><br>
+<textarea name="content" rows="10" required></textarea><br>
+<input type="submit" value="Add Post">
+</form>
+<a href="/">Back to Blog</a>
+</body>
+</html>
+EOF'
+
+# ----------------------------
+# Create systemd service for Flask
+# ----------------------------
+sudo bash -c 'cat << "EOF" > /etc/systemd/system/personal_blog.service
+[Unit]
+Description=Personal Blog Flask App
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/personal_blog
+Environment=PORT=5000
+Environment=DYNAMO_TABLE=BlogPosts
+Environment=AWS_REGION=eu-central-1
+ExecStart=/usr/bin/python3 /home/ec2-user/personal_blog/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable personal_blog.service
+sudo systemctl start personal_blog.service
+
+# ----------------------------
+# Setup self-signed SSL for Nginx
+# ----------------------------
+sudo mkdir -p /etc/nginx/ssl
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/personal_blog.key \
+  -out /etc/nginx/ssl/personal_blog.crt \
+  -subj "/C=US/ST=State/L=City/O=Organization/OU=IT/CN=localhost"
+
+# ----------------------------
+# Configure Nginx as reverse proxy
+# ----------------------------
+sudo bash -c 'cat << "EOF" > /etc/nginx/conf.d/personal_blog.conf
+server {
+    listen 80;
+    server_name _;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate /etc/nginx/ssl/personal_blog.crt;
+    ssl_certificate_key /etc/nginx/ssl/personal_blog.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+EOF'
+
+sudo systemctl enable nginx
+sudo systemctl start nginx
